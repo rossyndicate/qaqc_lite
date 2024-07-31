@@ -8,18 +8,10 @@
 #' @param api_token API token for accessing HydroVu. Pulled in via `hv_auth()`.
 #' @param dump_dir Directory where raw API data will be saved to.
 
-api_puller <- function(site, network, start_dt, end_dt = Sys.time(), api_token, dump_dir) {
+api_puller <- function(site, start_dt, end_dt = Sys.time(), api_token, dump_dir) {
 
-  if(network %in% c("all", "All", "virridy", "Virridy")){
 
     locs <- hv_locations_all(hv_token)
-
-  } else if(network %in% c("csu", "fcw", "CSU", "FCW")){
-
-    locs <- hv_locations_all(hv_token) %>%
-      dplyr::filter(!grepl("virridy", name, ignore.case = TRUE))
-
-  }
 
   # make a list of site names
 
@@ -75,39 +67,10 @@ api_puller <- function(site, network, start_dt, end_dt = Sys.time(), api_token, 
         dplyr::mutate(site = tolower(site[i])) %>%
         dplyr::select(site, id, name, timestamp, parameter, value, units)
 
-      if(network %in% c("csu", "CSU", "fcw", "FCW")){
-
         readr::write_csv(one_df,
                          paste0(dump_dir, "/", site[i], "_", stringr::str_replace(stringr::str_replace(substr(end_dt, 1, 16), "[:\\s]", "_"), ":", ""), ".csv"))
 
-      # if site contains both a CSU and a Virridy sonde, split them up to store them
-      # separately:
-      } else if(network %in% c("all","All","Virridy","virridy")){
-
-        if(site[i] %in% c("Timberline", "Prospect", "Archery")){
-
-          try(virridy_df <- one_df %>%
-                dplyr::filter(grepl("virridy", name, ignore.case = TRUE)) %>%
-                dplyr::mutate(site = paste0(site[i], " virridy")))
-
-          try(readr::write_csv(virridy_df,
-                               paste0(dump_dir, "/", site[i], " virridy_", stringr::str_replace(stringr::str_replace(substr(end_dt, 1, 16), "[:\\s]", "_"), ":", ""), ".csv")))
-
-          csu_df <- one_df %>%
-            dplyr::filter(!grepl("virridy", name, ignore.case = TRUE))
-
-          readr::write_csv(csu_df,
-                           paste0(dump_dir, "/", site[i], "_", stringr::str_replace(stringr::str_replace(substr(end_dt, 1, 16), "[:\\s]", "_"), ":", ""), ".csv"))
-
-        } else {
-
-          # otherwise, save the full data set
-
-          readr::write_csv(one_df,
-                           paste0(dump_dir, "/", site[i], "_", stringr::str_replace(stringr::str_replace(substr(end_dt, 1, 16), "[:\\s]", "_"), ":", ""), ".csv"))
         }
       }
-    }
-  }
 
 }

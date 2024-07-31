@@ -407,10 +407,6 @@ incoming_data_csvs_upload &lt;- api_puller(site = c(&quot;JOEI&quot;, &quot;CBRI
                                                  &quot;Timberline&quot;, &quot;SpringCreek&quot;, &quot;Prospect&quot;,
                                                   &quot;Boxelder&quot;, &quot;BoxCreek&quot;, &quot;Archery&quot;,
                                                  &quot;River Bluffs&quot;),
-                           # select which sondes to download data from
-                           # ROSSyndicate manages two sets of sondes
-                           # Virridy and City of Fort Collins
-                                        network = &quot;all&quot;,
                                         start_dt = &quot;2024-07-01 01:00:00 MDT&quot;,
                                         end_dt = Sys.time(),
                                         api_token = hv_token,
