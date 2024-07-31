@@ -1,0 +1,371 @@
+---
+title: 'QAQC "Lite"'
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 90
+---
+
+This is a "lite" workflow to perform simple quality assurance/quality control (QA/QC)
+steps across water quality data pulled from HydroVu. Specifically, this workflow
+identifies the following:
+
+1)  Observations that fall outside In-Situ's sensor specification ranges
+
+2)  Observations that fall outside seasonal thresholds for slope and mean developed on
+    historical, clean data
+
+3)  Observations during times when the sonde was not submerged in water
+
+4)  Observations during times when the water was freezing
+
+5)  Observations with missing data
+
+6)  Observations that repeat through time
+
+    Plus, several "experimental" flags that aim at finding:
+
+7)  DO observations with "noise" (i.e., dropping/hopping DO)
+
+8)  Turbidity drift from biofouling
+
+9)  Identifying observations "sandwiched" between flagged data (called "suspect"
+    observations)
+
+We have also developed several approaches to reduce over-flagging by:
+
+-   Removing slope flags for sensor data that occurs at the same time as a change in
+    temperature or depth
+
+-   Removing (appropriate) flags that occurred at roughly the same time at an upstream or
+    downstream location. **The associated function, `network_check()`, will require heavy
+    modification to perform across a different network of sites than ROSSyndicate's Poudre
+    Sonde Network.**
+
+To run this pipeline, you must have credentials for accessing HydroVu's API, stored in a
+called `HydroVuCreds.yml`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE, warnings = 'hide', error = FALSE)
+library(tidyverse)
+library(zoo)
+library(padr)
+library(stats)
+library(janitor)
+library(yaml)
+library(RcppRoll)
+library(ggpubr)
+# devtools::install_github(repo = "steeleb/HydroVuR")
+library(HydroVuR)
+
+walk(list.files('src/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
+```
+
+## *Step 1: Import and collate data*
+
+Download all the API data. This step requires HydroVu credentials and an understanding of
+your sites' site names. See `creds/HydroVuCredsTemplate.yml` for a template to use for
+formatting credentials properly.
+
+```{r api, eval = FALSE}
+hv_creds <- read_yaml("creds/HydroVuCreds.yml")
+
+hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
+                    client_secret = as.character(hv_creds["secret"]),
+                    url = "https://www.hydrovu.com/public-api/oauth/token")
+
+incoming_data_csvs_upload <- api_puller(site = c("JOEI", "CBRI", "CHD", "PFAL",
+                                                 "PBD", "SFM", "LBEA", "PENN",
+                                                 "Tamasag", "Legacy", "Lincoln",
+                                                 "Timberline", "SpringCreek", "Prospect",
+                                                  "Boxelder", "BoxCreek", "Archery",
+                                                 "River Bluffs"),
+                           # select which sondes to download data from
+                           # ROSSyndicate manages two sets of sondes
+                           # Virridy and City of Fort Collins
+                                        network = "all",
+                                        start_dt = "2024-07-01 01:00:00 MDT",
+                                        end_dt = Sys.time(),
+                                        api_token = hv_token,
+                                        dump_dir = "data/api/"
+                                        )
+```
+
+Collate all the data at a user-specified interval:
+
+```{r}
+all_data <- munge_api_data(api_path = "data/api/",
+                           # Select which sondes to download data from:
+                           # ROSSyndicate manages two sets of sondes, 
+                           # Virridy and City of Fort Collins.
+                           network = "all",
+                           # What interval do you want data analyzed across?
+                           summarize_interval = "15 minutes") # Other example: "1 hour"
+```
+
+## *Step 2: Get basic statistics about the data*
+
+Here, we split up all of our site-parameter combinations into a list that we can more
+easily iterate over. Then, across those lists, we average any observations whose frequency
+is greater than our interval of interest so that our data set is consistently recorded at
+that intervals. We also preserve the total number of observations within the time interval
+used to calculate the mean, as well as the spread (max-min). After these calculations, we
+use {padr}'s `pad()` function to fill in data gaps at the selected interval.
+
+```{r}
+# Determine each site and parameter in our raw data `all_data`:
+sites <- unique(all_data$site)
+
+# Of those, which do we want to keep?
+params <- c(
+  "Chl-a Fluorescence", 
+  "Depth", 
+  "DO", 
+  "ORP", 
+  "pH",
+  "Specific Conductivity",
+  "Temperature",
+  "Turbidity",
+  "FDOM Fluorescence")
+
+# Here we construct a data frame to iterate over each site-parameter combination.
+site_param_combos <- tidyr::crossing(sites, params)
+
+# Make a list of the 15-minute summarized data.
+all_data_tidied_list <- purrr::map2(.x = site_param_combos$sites, 
+                                    .y = site_param_combos$params, 
+                                    ~tidy_data(site_arg = .x,
+                                               parameter_arg = .y,
+                                               api_data = all_data,
+                                               # Same interval as upstream step:
+                                               summarize_interval = "15 minutes")) %>% 
+  # Set the names for the dfs in the list:
+  purrr::set_names(paste0(site_param_combos$sites, "-", site_param_combos$params)) %>% 
+  # Remove NULL from the list (indicating a site-param combo that doesn't actually exist):
+  purrr::keep(~ !is.null(.))
+```
+
+#### *Add summary stats*
+
+Here, we are adding in contextual summary statistics that can be used to describe a given
+observation's relationship to its neighboring observations. This includes:
+
+-   the previous and next observation and their slopes
+-   the 7-point (each observation and the previous 6) moving median, mean, slope, and
+    standard deviation
+-   the hydrologic "season" in which the observation lands in. Currently we are defining
+    them as...
+    -   Winter base flow: Dec, Jan, Feb, Mar, Apr
+
+    -   Snow melt: May, Jun
+
+    -   Monsoon: Jul, Aug, Sep
+
+    -   Fall base flow: Oct, Nov
+
+```{r}
+all_data_summary_stats_list <- all_data_tidied_list %>%
+  purrr::map(~ generate_summary_statistics(.)) 
+```
+
+## *Step 3: Create data thresholds*
+
+Next, we create a look-up table for site-parameter thresholds to use in flagging strange
+data. These thresholds should ULTIMATELY be based on an approved subset of human-verified
+GOOD historical data. But if a historical cleaned data set does not yet exist, we can
+reduce the current data set to "good"-ish data by using some automated cleaning steps, and
+use that data as a placeholder for making a first pass for thresholds.
+
+```{r}
+# "Placeholder" for when there is no clean, historical data to develop thresholds with:
+goodish_data_placeholder <- all_data_summary_stats_list %>%
+  # Find instances outside of In-Situ's sensor spec ranges
+  map(~add_spec_flag(df = ., spec_table = yaml::read_yaml("data/qaqc/sensor_spec_thresholds.yml"))) %>%
+  dplyr::bind_rows() %>%
+  # Intersensor flags require data by SITE, not SITE-PARAMETER
+  split(f = .$site, sep = "-") %>%
+  # Flag data when water was below freezing
+  map(~add_frozen_flag(df = .)) %>%
+  # Flag data when sonde was not submerged in water
+  map(~add_unsubmerged_flag(df = .)) %>%
+  dplyr::bind_rows() %>%
+  # Filter to only un-flagged data (that we can semi-confidently assume is "bad" data):
+  dplyr::filter(is.na(flag)) %>%
+  # Reconfigure to site-parameter for future processing
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  # remove NULL from the list (indicating a site-param combo that doesn't actually exist)
+  purrr::keep(~ !is.null(.))
+
+# Create data stats across the clean data to define seasonal thresholds:
+threshold_lookup <- purrr::map(goodish_data_placeholder, make_threshold_table) %>%
+  dplyr::bind_rows()
+
+# Save the threshold table
+readr::write_csv(threshold_lookup, 'data/qaqc/seasonal_thresholds_placeholder.csv')
+```
+
+## *Step 4: Flag data*
+
+Here, we add flags to each of our data sets:
+
+```{r}
+# Some flags only use the sensor's data:
+single_sensor_flags <- purrr::map(all_data_summary_stats_list, function(data) {
+  data %>%
+    # flag instances outside the spec range
+    add_spec_flag(df = ., spec_table = yaml::read_yaml("data/qaqc/sensor_spec_thresholds.yml")) %>%
+    # flag data outside of seasonal range (using our thresholds developed above):
+    add_seasonal_flag(df = ., threshold_table = threshold_lookup) %>%
+    # flag missing data
+    add_na_flag(df = .) %>%
+    # flag DO noise (STILL WIP)
+    find_do_noise(df = .) %>%
+    # flag repeating values
+    add_repeat_flag(df = .)
+})
+
+# Other flags use a combination of either other sensors on the same sonde,
+# or other sensors on other sondes:
+intersensor_flags <- single_sensor_flags %>%
+  dplyr::bind_rows() %>%
+  split(f = .$site, sep = "-") %>%
+  # Flag turbidity sensor drift (STILL WIP):
+  purrr::map(~add_drift_flag(.)) %>%
+  # Flag times when water was below freezing:
+  purrr::map(~add_frozen_flag(.)) %>%
+  # An approach to reduce overflagging. We remove a subset of 
+  # slope flags if they occur concurrently with temp or depth
+  # (if temp/depth change, chances are its a real observation):
+  purrr::map(~intersensor_check(.)) %>%
+  # Flag times when sonde was unsubmerged:
+  purrr::map(~add_unsubmerged_flag(.)) %>%
+  dplyr::bind_rows() %>%
+  data.table::data.table() %>%
+  # Lil' cleanup of flag column contents
+  dplyr::mutate(flag = ifelse(flag == "", NA, flag)) %>%
+  # Transform back to site-parameter dfs
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  purrr::discard(~ nrow(.) == 0)
+
+# Go across sites to remove seasonal threshold flags that occurred 
+# up-/down-stream at the same time. 
+# Lastly, if over 50% of data is flagged in a moving 2-hour window, flag ALL 
+# the data in that window
+final_flags <- intersensor_flags %>%
+  # Creates new column, "flag", that attempts to reduce
+  # overflagging of drastic system-wide WQ changes
+  purrr::map(~network_check(df = ., network = "all")) %>%
+  dplyr::bind_rows() %>%
+  # Lil' cleanup after removing some flags:
+  dplyr::mutate(flag = str_replace_all(flag, ";", "")) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  # Lastly, if over 50% of data is flagged in a moving 2-hour window, 
+  # flag ALL the data in that window. 
+  purrr::map(~add_suspect_flag(.)) %>%
+  dplyr::bind_rows() %>%
+  # Remove lonely "suspect" flags after auto-cleaning of data (i.e.,
+  # suspect observations hat are totally isolated and no longer linked 
+  # to any "real" quality flag). This should not happen as this
+  # workflow as it is written, so it is just a precautionary step.
+  dplyr::mutate(flag = ifelse(is.na(flag), NA,
+                                    ifelse(flag == "suspect data" & 
+                                           is.na(dplyr::lag(flag, 1)) & 
+                                           is.na(dplyr::lead(flag, 1)), NA,
+                                           flag))) %>%
+  # Remove unnecessary columns used in flag dev:
+  dplyr::select(DT_round, season, site, parameter, mean, diff, n_obs, flag)
+
+# Save a version of the data set for future verification steps:
+saveRDS(final_flags, 
+        file = 'data/all_data_auto_flagged.RDS') 
+```
+
+*Example of data after flagging:*
+```{r, eval = TRUE, hide = TRUE, echo = FALSE, message = FALSE}
+final_flags <- readRDS('data/all_data_auto_flagged.RDS')
+```
+
+```{r, eval = TRUE, fig.height = 12, fig.cap = 'An example plot of flagged data at a site of interest, as well as the site upstream of it for comparison. Pink points indicate flagged data at the site of interest, while blue points indicate "suspect" data (if/when they exist in the time frame selected).'}
+
+site_name <- "boxelder"
+start_date <- "2024-07-20"
+end_date <- "2024-07-27"
+# upstream site
+up_name <- "prospect"
+
+example_data <- final_flags %>%
+  dplyr::mutate(date = lubridate::as_date(DT_round)) %>%
+  dplyr::filter(site == site_name)%>%
+  dplyr::filter(date >= start_date & date <= end_date)
+
+up_dat <- final_flags %>%
+  dplyr::mutate(date = lubridate::as_date(DT_round)) %>%
+  dplyr::filter(site == up_name) %>%
+  dplyr::filter(date >= start_date & date <= end_date)
+
+pH <- ggplot() +
+  geom_line(data = filter(up_dat, parameter == "pH"), 
+            aes(DT_round, mean), color = "darkgrey") +
+  geom_line(data = filter(example_data, parameter == "pH"), 
+            aes(DT_round, mean)) +
+  geom_point(data = filter(example_data, parameter == "pH" & !is.na(flag)), 
+             aes(DT_round, mean), color = "#E70870") +
+    geom_point(data = filter(example_data, parameter == "pH" & flag == "suspect data"),
+             aes(DT_round, mean), color = "#256BF5" ) +
+  ylab("pH") + xlab("") +
+  ggtitle(paste0(site_name, " (black) and ", up_name, " (grey)")) +
+  theme_bw()
+
+specific_conductivity <-   ggplot() +
+    geom_line(data = filter(up_dat, parameter == "Specific Conductivity"), 
+            aes(DT_round, mean), color = "darkgrey") +
+  geom_line(data = filter(example_data, parameter == "Specific Conductivity"), 
+            aes(DT_round, mean)) +
+  geom_point(data = filter(example_data, parameter == "Specific Conductivity" & !is.na(flag)), 
+             aes(DT_round, mean), color = "#E70870") +
+    geom_point(data = filter(example_data, parameter == "Specific Conductivity" & flag == "suspect data"),
+             aes(DT_round, mean), color = "#256BF5" ) +
+  ylab("Specific Conductivity ug/L") + xlab("") +
+  theme_bw()
+
+dissolved_oxygen <-  ggplot() +
+    geom_line(data = filter(up_dat, parameter == "DO"), 
+            aes(DT_round, mean), color = "darkgrey") +
+  geom_line(data = filter(example_data, parameter == "DO"), 
+            aes(DT_round, mean)) +
+  geom_point(data = filter(example_data, parameter == "DO" & !is.na(flag)), 
+             aes(DT_round, mean), color = "#E70870") +
+    geom_point(data = filter(example_data, parameter == "DO" & flag == "suspect data"),
+             aes(DT_round, mean), color = "#256BF5" ) +
+  ylab("DO mg/L") + xlab("") +
+  theme_bw()
+
+turbidity <- ggplot() +
+    geom_line(data = filter(up_dat, parameter == "Turbidity"), 
+            aes(DT_round, mean), color = "darkgrey") +
+  geom_line(data = filter(example_data, parameter == "Turbidity"), 
+            aes(DT_round, mean)) +
+  geom_point(data = filter(example_data, parameter == "Turbidity" & !is.na(flag)), 
+             aes(DT_round, mean), color = "#E70870") +
+    geom_point(data = filter(example_data, parameter == "Turbidity" & flag == "suspect data"),
+             aes(DT_round, mean), color = "#256BF5" ) +
+  ylab("Turbidity NTU") + xlab("") +
+  theme_bw()
+
+temp <- ggplot() +
+    geom_line(data = filter(up_dat, parameter == "Temperature"), 
+            aes(DT_round, mean), color = "darkgrey") +
+  geom_line(data = filter(example_data, parameter == "Temperature"), 
+            aes(DT_round, mean)) +
+  geom_point(data = filter(example_data, parameter == "Temperature" & !is.na(flag)), 
+             aes(DT_round, mean), color = "#E70870") +
+    geom_point(data = filter(example_data, parameter == "Temperature" & flag == "suspect data"),
+             aes(DT_round, mean), color = "#256BF5" ) +
+  ylab("Temperature C") + xlab("") +
+  theme_bw()
+
+ggarrange(pH, specific_conductivity, dissolved_oxygen, turbidity, temp,
+          ncol = 1)
+```
